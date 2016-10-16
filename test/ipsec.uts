@@ -209,6 +209,41 @@ try:
 except IPSecIntegrityError as err:
     err
 
+#######################################
+= IPv4 / ESP - Tunnel - AES-CBC - HMAC-SHA1-96
+
+p = IP(src='1.1.1.1', dst='2.2.2.2')
+p /= TCP(sport=45012, dport=80)
+p /= Raw(b'testdata')
+p = IP(bytes(p))
+p
+
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CBC', crypt_key='sixteenbytes key',
+                         auth_algo='HMAC-SHA1-96', auth_key='secret key',
+                         tunnel_header=IP(src='11.11.11.11', dst='22.22.22.22'))
+
+e = sa.encrypt(p)
+e
+
+assert(isinstance(e, IP))
+* after encryption packet should be encapsulated with the given ip tunnel header
+assert(e.src == '11.11.11.11' and e.dst == '22.22.22.22')
+assert(e.chksum != p.chksum)
+assert(e.proto == socket.IPPROTO_ESP)
+assert(e.haslayer(ESP))
+assert(not e.haslayer(TCP))
+assert(e[ESP].spi == sa.spi)
+* after encryption the original packet payload should NOT be readable
+assert(b'testdata' not in e[ESP].data)
+
+* integrity verification should pass
+d = sa.decrypt(e)
+d
+
+* after decryption the original packet should be unaltered
+assert(d == p)
+
 ###############################################################################
 + IPv6 / ESP
 
@@ -899,3 +934,73 @@ assert(p.length == 5)
 assert(p.cert_type == 0)
 assert(p.cert_data == b'')
 assert(bytes(p) == b'\x00\x00\x00\x05\x00')
+
+######################################
+= ESP Sequence Numbering
+
+p = IP(src='1.1.1.1', dst='2.2.2.2')
+p /= TCP(sport=45012, dport=80)
+p /= Raw(b'testdata')
+p = IP(bytes(p))
+p
+
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CTR', crypt_key='16bytekey+4bytenonce',
+                         auth_algo='HMAC-SHA1-96', auth_key='secret key',
+                         tunnel_header=IP(src='11.11.11.11', dst='22.22.22.22'))
+
+# Sequence number should start at 1
+e = sa.encrypt(p)
+assert(e[ESP].seq == 1)
+
+# Sequence number should increment for each packet encrypted
+for i in range(2, 10):
+    e = sa.encrypt(p)
+    assert(e[ESP].seq == i)
+
+# Sequence number should come from the SA
+sa.seq_num = 1024
+e = sa.encrypt(p)
+assert(e[ESP].seq == 1024)
+
+######################################
+= ESP Extended Sequence Numbering
+
+p = IP(src='1.1.1.1', dst='2.2.2.2')
+p /= TCP(sport=45012, dport=80)
+p /= Raw(b'testdata')
+p = IP(bytes(p))
+p
+
+sa = SecurityAssociation(ESP, spi=0x222, esn=True,
+                         crypt_algo='AES-CTR', crypt_key='16bytekey+4bytenonce',
+                         auth_algo='HMAC-SHA1-96', auth_key='secret key',
+                         tunnel_header=IP(src='11.11.11.11', dst='22.22.22.22'))
+
+# Sequence number should start at 1
+e = sa.encrypt(p)
+assert(e[ESP].seq == 1)
+
+# Sequence number field in packet should wrap to 0 at 2^32
+seq = int(math.pow(2, 32) - 1)
+sa.seq_num = seq
+e = sa.encrypt(p)
+assert(e[ESP].seq == seq)
+
+e = sa.encrypt(p)
+assert(e[ESP].seq == 0)
+
+d = sa.decrypt(e)
+assert(d == p)
+
+# Upper 32 bits of the ESN should be included in the ICV
+e = sa.encrypt(p)
+assert(sa.seq_num > math.pow(2, 32))
+sa.esn = False
+try:
+    d = sa.decrypt(e)
+    assert(False)
+except IPSecIntegrityError as err:
+    err
+
+

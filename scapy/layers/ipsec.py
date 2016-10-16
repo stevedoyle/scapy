@@ -46,7 +46,7 @@ if not hasattr(socket, 'IPPROTO_AH'):
 if not hasattr(socket, 'IPPROTO_ESP'):
     socket.IPPROTO_ESP = 50
 
-    
+
 import fractions
 
 from scapy.data import IP_PROTOS
@@ -60,6 +60,7 @@ from scapy.layers.inet import IP, UDP
 from scapy.layers.inet6 import IPv6, IPv6ExtHdrHopByHop, IPv6ExtHdrDestOpt, \
     IPv6ExtHdrRouting
 
+import struct
 
 #------------------------------------------------------------------------------
 class AH(Packet):
@@ -465,12 +466,14 @@ class AuthAlgo(object):
             print(self.mac)
             return self.mac.new(key, digestmod=self.digestmod)
 
-    def sign(self, pkt, key):
+    def sign(self, pkt, key, seqhi=None):
         """
         Sign an IPSec (ESP or AH) packet with this algo.
 
         @param pkt:    a packet that contains a valid encrypted ESP or AH layer
         @param key:    the authentication key, a byte string
+        @param seqhi:  the upper 32 bits of an extended sequence number or None
+                       if esn is disabled.
 
         @return: the signed packet
         """
@@ -483,6 +486,8 @@ class AuthAlgo(object):
 
         if pkt.haslayer(ESP):
             mac.update(bytes(pkt[ESP]))
+            if seqhi:
+                mac.update(struct.pack(">I", seqhi))
             pkt[ESP].data += mac.digest()[:self.icv_size]
 
         elif pkt.haslayer(AH):
@@ -492,12 +497,14 @@ class AuthAlgo(object):
 
         return pkt
 
-    def verify(self, pkt, key):
+    def verify(self, pkt, key, seqhi=None):
         """
         Check that the integrity check value (icv) of a packet is valid.
 
         @param pkt:    a packet that contains a valid encrypted ESP or AH layer
         @param key:    the authentication key, a byte string
+        @param seqhi:  the upper 32 bits of the extended sequence number or
+                       None if esn is disabled.
 
         @raise IPSecIntegrityError: if the integrity check fails
         """
@@ -517,6 +524,8 @@ class AuthAlgo(object):
             pkt = pkt.copy()
             pkt.data = pkt.data[:len(pkt.data) - self.icv_size]
             mac.update(bytes(pkt))
+            if seqhi:
+                mac.update(struct.pack(">I", seqhi))
             computed_icv = mac.digest()[:self.icv_size]
 
         elif pkt.haslayer(AH):
@@ -710,8 +719,9 @@ class SecurityAssociation(object):
 
     SUPPORTED_PROTOS = (IP, IPv6)
 
-    def __init__(self, proto, spi, seq_num=1, crypt_algo=None, crypt_key=None,
-                 auth_algo=None, auth_key=None, tunnel_header=None, nat_t_header=None):
+    def __init__(self, proto, spi, seq_num=1, esn=False, crypt_algo=None,
+                 crypt_key=None, auth_algo=None, auth_key=None, tunnel_header=None,
+                 nat_t_header=None):
         """
         @param proto: the IPSec proto to use (ESP or AH)
         @param spi: the Security Parameters Index of this SA
@@ -725,6 +735,7 @@ class SecurityAssociation(object):
                               to encapsulate the encrypted packets.
         @param nat_t_header: an instance of a UDP header that will be used
                              for NAT-Traversal.
+        @param esn: extended sequence numbering.
         """
 
         if proto not in (ESP, AH, ESP.name, AH.name):
@@ -770,6 +781,8 @@ class SecurityAssociation(object):
                 raise TypeError('nat_t_header must be %s' % UDP.name)
         self.nat_t_header = nat_t_header
 
+        self.esn = esn
+
     def check_spi(self, pkt):
         if pkt.spi != self.spi:
             raise TypeError('packet spi=0x%x does not match the SA spi=0x%x' %
@@ -783,7 +796,13 @@ class SecurityAssociation(object):
             if len(iv) != self.crypt_algo.iv_size:
                 raise TypeError('iv length must be %s' % self.crypt_algo.iv_size)
 
-        esp = _ESPPlain(spi=self.spi, seq=seq_num or self.seq_num, iv=iv)
+        seq = seq_num or self.seq_num
+        seqhi = None
+        if self.esn:
+            seqhi = (seq >> 32) & 0xFFFFFFFF
+            seq = seq & 0xFFFFFFFF
+
+        esp = _ESPPlain(spi=self.spi, seq=seq, iv=iv)
 
         if self.tunnel_header:
             tunnel = self.tunnel_header.copy()
@@ -805,7 +824,7 @@ class SecurityAssociation(object):
         esp = self.crypt_algo.pad(esp)
         esp = self.crypt_algo.encrypt(esp, self.crypt_key)
 
-        self.auth_algo.sign(esp, self.auth_key)
+        self.auth_algo.sign(esp, self.auth_key, seqhi)
 
         if self.nat_t_header:
             nat_t_header = self.nat_t_header.copy()
@@ -901,13 +920,13 @@ class SecurityAssociation(object):
         else:
             return self._encrypt_ah(pkt, seq_num=seq_num)
 
-    def _decrypt_esp(self, pkt, verify=True):
+    def _decrypt_esp(self, pkt, verify=True, seqhi=None):
 
         encrypted = pkt[ESP]
 
         if verify:
             self.check_spi(pkt)
-            self.auth_algo.verify(encrypted, self.auth_key)
+            self.auth_algo.verify(encrypted, self.auth_key, seqhi)
 
         esp = self.crypt_algo.decrypt(encrypted, self.crypt_key,
                                       self.auth_algo.icv_size)
@@ -988,8 +1007,15 @@ class SecurityAssociation(object):
                             % (pkt.__class__, self.SUPPORTED_PROTOS))
 
         if self.proto is ESP and pkt.haslayer(ESP):
-            return self._decrypt_esp(pkt, verify=verify)
+            return self._decrypt_esp(pkt, verify=verify, seqhi=self._seqhi())
         elif self.proto is AH and pkt.haslayer(AH):
             return self._decrypt_ah(pkt, verify=verify)
         else:
             raise TypeError('%s has no %s layer' % (pkt, self.proto.name))
+
+    def _seqhi(self):
+        if self.esn:
+            seqhi = (self.seq_num >> 32) & 0xFFFFFFFF
+            return seqhi
+        return None
+

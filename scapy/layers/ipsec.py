@@ -493,6 +493,8 @@ class AuthAlgo(object):
         elif pkt.haslayer(AH):
             clone = zero_mutable_fields(pkt.copy(), sending=True)
             mac.update(bytes(clone))
+            if seqhi:
+                mac.update(struct.pack(">I", seqhi))
             pkt[AH].icv = mac.digest()[:self.icv_size]
 
         return pkt
@@ -533,6 +535,8 @@ class AuthAlgo(object):
 
             clone = zero_mutable_fields(pkt.copy(), sending=False)
             mac.update(bytes(clone))
+            if seqhi:
+                mac.update(struct.pack(">I", seqhi))
             computed_icv = mac.digest()[:self.icv_size]
 
         if pkt_icv != computed_icv:
@@ -851,7 +855,7 @@ class SecurityAssociation(object):
 
     def _encrypt_ah(self, pkt, seq_num=None):
 
-        ah = AH(spi=self.spi, seq=seq_num or self.seq_num,
+        ah = AH(spi=self.spi, seq = self._seqlo(seq_num or self.seq_num),
                 icv=chr(0) * self.auth_algo.icv_size)
 
         if self.tunnel_header:
@@ -891,7 +895,8 @@ class SecurityAssociation(object):
         else:
             ip_header.plen = len(ip_header.payload) + len(ah) + len(payload)
 
-        signed_pkt = self.auth_algo.sign(ip_header / ah / payload, self.auth_key)
+        signed_pkt = self.auth_algo.sign(ip_header / ah / payload,
+                                         self.auth_key, self._seqhi(seq_num))
 
         # sequence number must always change, unless specified by the user
         if seq_num is None:
@@ -962,11 +967,11 @@ class SecurityAssociation(object):
             # reassemble the ip_header with the ESP payload
             return ip_header / cls(esp.data)
 
-    def _decrypt_ah(self, pkt, verify=True):
+    def _decrypt_ah(self, pkt, verify=True, seqhi=None):
 
         if verify:
             self.check_spi(pkt)
-            self.auth_algo.verify(pkt, self.auth_key)
+            self.auth_algo.verify(pkt, self.auth_key, seqhi)
 
         ah = pkt[AH]
         payload = ah.payload
@@ -1009,13 +1014,16 @@ class SecurityAssociation(object):
         if self.proto is ESP and pkt.haslayer(ESP):
             return self._decrypt_esp(pkt, verify=verify, seqhi=self._seqhi())
         elif self.proto is AH and pkt.haslayer(AH):
-            return self._decrypt_ah(pkt, verify=verify)
+            return self._decrypt_ah(pkt, verify=verify, seqhi=self._seqhi())
         else:
             raise TypeError('%s has no %s layer' % (pkt, self.proto.name))
 
-    def _seqhi(self):
+    def _seqlo(self, seq_num):
+        return seq_num & 0xFFFFFFFF
+
+    def _seqhi(self, seq_num=None):
         if self.esn:
-            seqhi = (self.seq_num >> 32) & 0xFFFFFFFF
+            seqhi = ((seq_num or self.seq_num) >> 32) & 0xFFFFFFFF
             return seqhi
         return None
 

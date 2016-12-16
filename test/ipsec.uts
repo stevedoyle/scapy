@@ -169,6 +169,46 @@ d
 assert(d[TCP] == p[TCP])
 
 #######################################
+= IPv4 / ESP - Transport - AES-CTR - NULL - Test Vector
+# Test vector from RFC3686
+
+plaintext = b'\x53\x69\x6E\x67\x6C\x65\x20\x62\x6C\x6F\x63\x6B\x20\x6D\x73\x67'
+ciphertext = b'\xE4\x09\x5D\x4F\xB7\xA7\xB3\x79\x2D\x61\x75\xA3\x26\x13\x11\xB8'
+crypt_key = b'\xAE\x68\x52\xF8\x12\x10\x67\xCC\x4B\xF7\xA5\x76\x55\x77\xF3\x9E'
+nonce = b'\x00\x00\x00\x30'
+iv = b'\x00\x00\x00\x00\x00\x00\x00\x00'
+
+p = IP(src='1.1.1.1', dst='2.2.2.2')
+p /= Raw(plaintext)
+p = IP(bytes(p))
+p
+
+sa = SecurityAssociation(ESP, spi=0x222,
+                         crypt_algo='AES-CTR',
+                         crypt_key=crypt_key + nonce,
+                         auth_algo='NULL', auth_key=None)
+
+e = sa.encrypt(p, iv=iv)
+e
+
+assert(isinstance(e, IP))
+assert(e.src == '1.1.1.1' and e.dst == '2.2.2.2')
+assert(e.chksum != p.chksum)
+assert(e.proto == socket.IPPROTO_ESP)
+assert(e.haslayer(ESP))
+assert(e[ESP].spi == sa.spi)
+
+assert(len(e[ESP].data) == len(iv) + len(plaintext) + 2 + 2)
+assert(ciphertext in e[ESP].data)
+assert((iv + ciphertext) in e[ESP].data)
+
+d = sa.decrypt(e)
+d
+
+* after decryption original packet should be preserved
+assert(d[Raw].load == p[Raw].load)
+
+#######################################
 = IPv4 / ESP - Transport - Blowfish - NULL
 
 p = IP(src='1.1.1.1', dst='2.2.2.2')

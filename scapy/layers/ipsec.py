@@ -245,7 +245,7 @@ class CryptAlgo(object):
         """
         # XXX: Handle counter modes with real counters? RFCs allow the use of
         # XXX: random bytes for counters, so it is not wrong to do it that way
-        return os.urandom(self.iv_size - self.salt_size)
+        return os.urandom(self.iv_size)
 
     def new_cipher(self, key, iv, digest=None):
         """
@@ -265,6 +265,13 @@ class CryptAlgo(object):
             return Cipher(
                 self.cipher(key),
                 self.mode(iv, digest, len(digest)),
+                default_backend(),
+            )
+        elif self.mode == modes.CTR:
+            # With CTR, a ctr block of 1 is appended to the IV
+            return Cipher(
+                self.cipher(key),
+                self.mode(iv + struct.pack('!L', 1)),
                 default_backend(),
             )
         else:
@@ -291,8 +298,12 @@ class CryptAlgo(object):
         data_len = len(esp.data) + 2
 
         # according to the RFC4303, section 2.4. Padding (for Encryption)
-        # the size of the ESP payload must be a multiple of 32 bits
-        align = _lcm(self.block_size, 4)
+        # the size of the ESP payload must be a multiple of 32 bits.
+        # If the cipher algorithm is a block algorithm the size of the ESP
+        # payload must also be a multiple of the algorithm block size.
+        align = 4
+        if self.mode not in [modes.CTR, modes.GCM]:
+            align = _lcm(self.block_size, 4)
 
         # pad for block size
         esp.padlen = -data_len % align
@@ -320,6 +331,7 @@ class CryptAlgo(object):
         @return:    a valid ESP packet encrypted with this algorithm
         """
         data = esp.data_for_encryption()
+        iv = esp.iv
 
         if self.cipher:
             cipher = self.new_cipher(key, esp.iv)
@@ -330,12 +342,20 @@ class CryptAlgo(object):
                 encryptor.authenticate_additional_data(aad)
                 data = encryptor.update(data) + encryptor.finalize()
                 data += encryptor.tag[:self.icv_size]
+                # For AEAD algorithms, the packet carries only a portion of the
+                # IV
+                iv = iv[-self.iv_size:]
             else:
                 data = encryptor.update(data) + encryptor.finalize()
 
-        return ESP(spi=esp.spi, seq=esp.seq, data=esp.iv + data)
+            if self.mode == modes.CTR:
+                # For CTR algorithms, the packet carries only a portion of the
+                # IV
+                iv = iv[-self.iv_size:]
 
-    def decrypt(self, esp, key, icv_size=None):
+        return ESP(spi=esp.spi, seq=esp.seq, data=iv + data)
+
+    def decrypt(self, esp, key, icv_size=None, salt=None):
         """
         Decrypt an ESP packet
 
@@ -351,6 +371,9 @@ class CryptAlgo(object):
             icv_size = self.icv_size if self.is_aead else 0
 
         iv = esp.data[:self.iv_size]
+        if self.salt_size:
+            iv = salt + iv
+
         data = esp.data[self.iv_size:len(esp.data) - icv_size]
         icv = esp.data[len(esp.data) - icv_size:]
 
@@ -401,10 +424,12 @@ if algorithms:
     CRYPT_ALGOS['AES-CTR'] = CryptAlgo('AES-CTR',
                                        cipher=algorithms.AES,
                                        mode=modes.CTR,
+                                       iv_size=8,
                                        salt_size=4)
     CRYPT_ALGOS['AES-GCM'] = CryptAlgo('AES-GCM',
                                        cipher=algorithms.AES,
                                        mode=modes.GCM,
+                                       iv_size=8,
                                        salt_size=4,
                                        icv_size=16)
     if hasattr(modes, 'CCM'):
@@ -764,8 +789,11 @@ class SecurityAssociation(object):
 
             if crypt_key:
                 salt_size = self.crypt_algo.salt_size
-                self.crypt_key = (crypt_key[:len(crypt_key) - salt_size]).encode('ascii')
-                self.crypt_salt = (crypt_key[len(crypt_key) - salt_size:]).encode('ascii')
+                self.crypt_key = crypt_key[:len(crypt_key) - salt_size]
+                self.crypt_salt = crypt_key[len(crypt_key) - salt_size:]
+                if isinstance(crypt_key, str):
+                    self.crypt_key = self.crypt_key.encode('ascii')
+                    self.crypt_salt = self.crypt_salt.encode('ascii')
             else:
                 self.crypt_key = None
                 self.crypt_salt = None
@@ -804,11 +832,12 @@ class SecurityAssociation(object):
 
         if iv is None:
             iv = self.crypt_algo.generate_iv()
-            if self.crypt_salt:
-                iv = self.crypt_salt + iv
         else:
             if len(iv) != self.crypt_algo.iv_size:
                 raise TypeError('iv length must be %s' % self.crypt_algo.iv_size)
+
+        if self.crypt_salt:
+            iv = self.crypt_salt + iv
 
         esp = _ESPPlain(spi=self.spi, seq=seq_num or self.seq_num, iv=iv)
 
@@ -938,7 +967,8 @@ class SecurityAssociation(object):
 
         esp = self.crypt_algo.decrypt(encrypted, self.crypt_key,
                                       self.crypt_algo.icv_size or
-                                      self.auth_algo.icv_size)
+                                      self.auth_algo.icv_size,
+                                      self.crypt_salt)
 
         if self.tunnel_header:
             # drop the tunnel header and return the payload untouched
